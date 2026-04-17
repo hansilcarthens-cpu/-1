@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Settings, TrendingUp, Package, Info, DollarSign, Calculator, Link as LinkIcon, Plus, Trash2, ChevronDown, ChevronUp, Image as ImageIcon, Check, Save, History, ExternalLink, Download, X, Copy, Camera } from 'lucide-react';
+import { Settings, TrendingUp, Package, Info, DollarSign, Calculator, Link as LinkIcon, Plus, Trash2, ChevronDown, ChevronUp, Image as ImageIcon, Check, Save, History, ExternalLink, Download, X, Copy, Camera, Users } from 'lucide-react';
 import { toJpeg } from 'html-to-image';
 import ExcelJS from 'exceljs';
 import { saveAs } from 'file-saver';
@@ -8,6 +8,9 @@ export default function App() {
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'success'>('idle');
   const [screenshotStatus, setScreenshotStatus] = useState<'idle' | 'taking' | 'success'>('idle');
   const [showHistory, setShowHistory] = useState(false);
+  const [currentUser, setCurrentUser] = useState(() => {
+    return typeof window !== 'undefined' ? (localStorage.getItem('activeUser') || '') : '';
+  });
   const containerRef = useRef<HTMLDivElement>(null);
 
   // 0.0 产品采集记录 (Source History)
@@ -116,10 +119,11 @@ export default function App() {
           pageScreenshot: pageScreenshot, // 存储页面截图
           cost: totalBaseCostRMB,
           summary: pricingSummary,
-          time: new Date().toISOString() 
+          time: new Date().toISOString(),
+          owner: currentUser || 'public' // 归属用户
         },
         ...sourceHistory.filter(h => h.link !== productInfo.link)
-      ].slice(0, 50); // 包含截图后限制在50条，防止浏览器存储溢出
+      ].slice(0, 100); // 个人模式支持更多记录
       setSourceHistory(newHistory);
       localStorage.setItem('sourceHistory', JSON.stringify(newHistory));
     }
@@ -236,6 +240,16 @@ export default function App() {
     }
   };
 
+  const filteredHistory = sourceHistory.filter(item => {
+    if (!currentUser) return item.owner === 'public' || !item.owner;
+    return item.owner === currentUser;
+  });
+
+  const updateActiveUser = (val: string) => {
+    setCurrentUser(val);
+    localStorage.setItem('activeUser', val);
+  };
+
   const deleteHistoryItem = (linkToDelete: string) => {
     const updatedHistory = sourceHistory.filter(item => item.link !== linkToDelete);
     setSourceHistory(updatedHistory);
@@ -310,7 +324,20 @@ export default function App() {
           </div>
         </div>
         
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-4">
+          <div className="flex items-center gap-2 bg-slate-100 p-1 rounded-xl border border-slate-200 shadow-inner">
+            <div className="pl-2.5">
+              <Users className="w-3.5 h-3.5 text-slate-400" />
+            </div>
+            <input 
+              type="text"
+              placeholder="输入你的代号/PIN (区分隐私记录)"
+              value={currentUser}
+              onChange={(e) => updateActiveUser(e.target.value)}
+              className="bg-transparent text-[11px] font-bold text-ink outline-none w-32 placeholder:text-slate-300 placeholder:font-normal"
+            />
+          </div>
+
           <button 
             onClick={handleSave}
             disabled={saveStatus !== 'idle'}
@@ -382,7 +409,9 @@ export default function App() {
                   <div className="absolute left-0 right-0 top-full mt-2 bg-white border border-slate-200 rounded-xl shadow-xl z-50 max-h-[240px] overflow-y-auto overflow-x-hidden p-2 space-y-1 animate-in fade-in slide-in-from-top-2 duration-200">
                     <div className="flex justify-between items-center px-2 py-1 border-b border-slate-100 mb-1">
                       <div className="flex items-center gap-2">
-                        <span className="text-[10px] font-bold text-muted uppercase">最近历史 ({sourceHistory.length}/50)</span>
+                        <span className="text-[10px] font-bold text-muted uppercase">
+                          {currentUser ? `[ ${currentUser} ] 的记录` : '公共记录'} ({filteredHistory.length})
+                        </span>
                       </div>
                       <div className="flex items-center gap-3">
                         <button 
@@ -399,7 +428,7 @@ export default function App() {
                         </button>
                       </div>
                     </div>
-                    {sourceHistory.map((item, idx) => (
+                    {filteredHistory.map((item, idx) => (
                       <div 
                         key={idx} 
                         className="group flex items-center gap-3 p-2 hover:bg-slate-50 rounded-lg cursor-pointer transition-colors border border-transparent hover:border-slate-100"
