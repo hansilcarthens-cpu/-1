@@ -3,6 +3,7 @@ import { Settings, TrendingUp, Package, Info, DollarSign, Calculator, Link as Li
 import { toJpeg } from 'html-to-image';
 import ExcelJS from 'exceljs';
 import { saveAs } from 'file-saver';
+import localforage from 'localforage';
 
 export default function App() {
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'success'>('idle');
@@ -13,11 +14,30 @@ export default function App() {
   });
   const containerRef = useRef<HTMLDivElement>(null);
 
-  // 0.0 产品采集记录 (Source History)
-  const [sourceHistory, setSourceHistory] = useState(() => {
-    const saved = typeof window !== 'undefined' ? localStorage.getItem('sourceHistory') : null;
-    return saved ? JSON.parse(saved) : [];
-  });
+  // 0.0 产品采集记录 (Source History) - 使用 IndexedDB 避开 5MB 限制
+  const [sourceHistory, setSourceHistory] = useState<any[]>([]);
+
+  // 异步加载历史记录
+  useEffect(() => {
+    const initStorage = async () => {
+      try {
+        const saved = await localforage.getItem<any[]>('sourceHistory');
+        // 迁移逻辑：如果 localStorage 还有旧数据，尝试合并后清除
+        const oldSaved = localStorage.getItem('sourceHistory');
+        if (oldSaved && !saved) {
+          const oldData = JSON.parse(oldSaved);
+          setSourceHistory(oldData);
+          await localforage.setItem('sourceHistory', oldData);
+          localStorage.removeItem('sourceHistory');
+        } else if (saved) {
+          setSourceHistory(saved);
+        }
+      } catch (e) {
+        console.error('Failed to load history from IndexedDB', e);
+      }
+    };
+    initStorage();
+  }, []);
 
   // 0. 产品基础信息 (Product Info)
   const [productInfo, setProductInfo] = useState(() => {
@@ -78,65 +98,121 @@ export default function App() {
 
   // 保存设置到 LocalStorage (包含自动截图)
   const handleSave = async () => {
+    if (saveStatus !== 'idle') return;
     setSaveStatus('saving');
     
-    let pageScreenshot = '';
-    // 自动抓取当前页面截图 (极高清晰度采样)
-    if (containerRef.current) {
-      try {
-        pageScreenshot = await toJpeg(containerRef.current, {
-          quality: 1.0, 
-          backgroundColor: '#f1f5f9',
-          pixelRatio: 3.0, // 3.0 采样率确保 Excel 里的图片达到超高清级别
-          style: {
-            padding: '16px',
-            borderRadius: '0'
-          }
-        });
-      } catch (err) {
-        console.error('Auto screenshot failed', err);
+    try {
+      let pageScreenshot = '';
+      // 自动抓取当前页面截图 (极致优化：2.0 采样率)
+      if (containerRef.current) {
+        try {
+          // 给截图增加一个 5 秒的超时限制，防止某些环境下挂起导致按钮卡死
+          const screenshotPromise = toJpeg(containerRef.current, {
+            quality: 0.8, 
+            backgroundColor: '#f1f5f9',
+            pixelRatio: 2.0, 
+            style: {
+              padding: '16px',
+              borderRadius: '0'
+            }
+          });
+
+          const timeoutPromise = new Promise<string>((_, reject) => 
+            setTimeout(() => reject(new Error('Screenshot timeout')), 5000)
+          );
+
+          pageScreenshot = await Promise.race([screenshotPromise, timeoutPromise]);
+        } catch (err) {
+          console.error('Screenshot skipped or failed', err);
+        }
       }
+
+      // 记录货源历史
+      if (productInfo.link && productInfo.link.trim() !== '') {
+        // 构造当前定价摘要
+        const pricingSummary = countries.map(c => {
+          const rate = safeNum(c.rate);
+          const sellingPriceRMB = rate > 0 ? safeNum(c.sellingPriceLocal) / rate : 0;
+          const totalFeesRMB = sellingPriceRMB * (totalFeePercent);
+          const totalCostRMB = totalBaseCostRMB + safeNum(c.intFreightRMB);
+          const profitRMB = sellingPriceRMB - totalCostRMB - totalFeesRMB;
+          const profitMargin = sellingPriceRMB > 0 ? (profitRMB / sellingPriceRMB) * 100 : 0;
+          return `${c.id}:${formatNum(profitMargin)}%`;
+        }).join(' | ');
+
+        const newHistory = [
+          { 
+            name: productInfo.name || '未命名产品', 
+            link: productInfo.link, 
+            image: productInfo.image,
+            pageScreenshot: pageScreenshot,
+            cost: totalBaseCostRMB,
+            summary: pricingSummary,
+            time: new Date().toISOString(),
+            owner: currentUser || 'public',
+            fullState: {
+              productInfo,
+              variants,
+              rates,
+              baseCost,
+              countries,
+              marketingMultiplier
+            }
+          },
+          ...sourceHistory.filter(h => h.link !== productInfo.link)
+        ].slice(0, 100);
+        
+        setSourceHistory(newHistory);
+        await localforage.setItem('sourceHistory', newHistory);
+      }
+
+      localStorage.setItem('productInfo', JSON.stringify(productInfo));
+      localStorage.setItem('variants', JSON.stringify(variants));
+      localStorage.setItem('rates', JSON.stringify(rates));
+      localStorage.setItem('baseCost', JSON.stringify(baseCost));
+      localStorage.setItem('countries', JSON.stringify(countries));
+      localStorage.setItem('marketingMultiplier', marketingMultiplier.toString());
+      
+      setSaveStatus('success');
+      
+      // 保存成功后，延迟一小会重置页面
+      setTimeout(() => {
+        setSaveStatus('idle');
+        resetForm();
+      }, 1500);
+    } catch (err) {
+      console.error('Save failed', err);
+      // 就算失败也要退回到初始状态，防止按钮一直卡在加载
+      setSaveStatus('idle');
+      alert('保存失败: ' + (err instanceof Error ? err.message : '未知错误'));
     }
+  };
 
-    // 记录货源历史
-    if (productInfo.link && productInfo.link.trim() !== '') {
-      // 构造当前定价摘要
-      const pricingSummary = countries.map(c => {
-        const rate = safeNum(c.rate);
-        const sellingPriceRMB = rate > 0 ? safeNum(c.sellingPriceLocal) / rate : 0;
-        const totalFeesRMB = sellingPriceRMB * (totalFeePercent);
-        const totalCostRMB = totalBaseCostRMB + safeNum(c.intFreightRMB);
-        const profitRMB = sellingPriceRMB - totalCostRMB - totalFeesRMB;
-        const profitMargin = sellingPriceRMB > 0 ? (profitRMB / sellingPriceRMB) * 100 : 0;
-        return `${c.id}:${formatNum(profitMargin)}%`;
-      }).join(' | ');
-
-      const newHistory = [
-        { 
-          name: productInfo.name || '未命名产品', 
-          link: productInfo.link, 
-          image: productInfo.image,
-          pageScreenshot: pageScreenshot, // 存储页面截图
-          cost: totalBaseCostRMB,
-          summary: pricingSummary,
-          time: new Date().toISOString(),
-          owner: currentUser || 'public' // 归属用户
-        },
-        ...sourceHistory.filter(h => h.link !== productInfo.link)
-      ].slice(0, 100); // 个人模式支持更多记录
-      setSourceHistory(newHistory);
-      localStorage.setItem('sourceHistory', JSON.stringify(newHistory));
-    }
-
-    localStorage.setItem('productInfo', JSON.stringify(productInfo));
-    localStorage.setItem('variants', JSON.stringify(variants));
-    localStorage.setItem('rates', JSON.stringify(rates));
-    localStorage.setItem('baseCost', JSON.stringify(baseCost));
-    localStorage.setItem('countries', JSON.stringify(countries));
-    localStorage.setItem('marketingMultiplier', marketingMultiplier.toString());
+  const resetForm = () => {
+    // 保持原有设置，仅清除产品特有数据
+    const defaultProduct = { name: '', image: '', link: '' };
+    const defaultVariants = [{ id: '1', color: '', size: '', weight: 0, length: 0, width: 0, height: 0, cost: 0 }];
     
-    setSaveStatus('success');
-    setTimeout(() => setSaveStatus('idle'), 2000);
+    // 保持基础成本里的物流/贴标设置，仅清除产品拿货价
+    const updatedBaseCost = { ...baseCost, product: 0 };
+    
+    // 保持各国的 汇率、运费设置、目标毛利，仅清除售价
+    const updatedCountries = countries.map(c => ({
+      ...c,
+      sellingPriceLocal: 0
+    }));
+
+    setProductInfo(defaultProduct);
+    setVariants(defaultVariants);
+    setBaseCost(updatedBaseCost);
+    setCountries(updatedCountries);
+    setScreenshotStatus('idle');
+
+    // 同步到本地缓存（确保重新打开软件也是干净的状态，但保留了设置）
+    localStorage.setItem('productInfo', JSON.stringify(defaultProduct));
+    localStorage.setItem('variants', JSON.stringify(defaultVariants));
+    localStorage.setItem('baseCost', JSON.stringify(updatedBaseCost));
+    localStorage.setItem('countries', JSON.stringify(updatedCountries));
   };
 
   // 导出历史记录为 Excel (内嵌图片形式 - 高清版)
@@ -154,7 +230,7 @@ export default function App() {
         { header: '货源链接', key: 'link', width: 30 },
         { header: '产品图', key: 'productImg', width: 20 },
         { header: '算价页面快照', key: 'analysisImg', width: 60 },
-        { header: '概览：利润率分析', key: 'summary', width: 45 },
+        { header: '概览：利润率信息', key: 'summary', width: 45 },
         { header: '采购成本(RMB)', key: 'cost', width: 15 },
         { header: '记录时间', key: 'time', width: 20 },
       ];
@@ -183,7 +259,7 @@ export default function App() {
         row.height = 140;
         row.alignment = { vertical: 'middle', wrapText: true, horizontal: 'center' };
 
-        // 1. 插入分析快照 (高清晰度)
+        // 1. 插入快照 (高清晰度)
         if (item.pageScreenshot) {
           try {
             const snapId = workbook.addImage({
@@ -253,7 +329,7 @@ export default function App() {
   const deleteHistoryItem = (linkToDelete: string) => {
     const updatedHistory = sourceHistory.filter(item => item.link !== linkToDelete);
     setSourceHistory(updatedHistory);
-    localStorage.setItem('sourceHistory', JSON.stringify(updatedHistory));
+    localforage.setItem('sourceHistory', updatedHistory).catch(console.error);
   };
 
   // 通用处理函数
@@ -317,7 +393,7 @@ export default function App() {
             <DollarSign className="w-6 h-6 text-white stroke-[2.5]" />
           </div>
           <div>
-            <h1 className="text-xl font-extrabold tracking-tight uppercase leading-none text-ink">定价与利润分析</h1>
+            <h1 className="text-xl font-extrabold tracking-tight uppercase leading-none text-ink">定价与利润核算</h1>
             <div className="flex items-center gap-2 mt-1">
               <span className="bg-ink text-[10px] text-white px-2 py-0.5 rounded font-bold">TIKTOK 东南亚地区</span>
             </div>
@@ -339,6 +415,15 @@ export default function App() {
           </div>
 
           <button 
+            onClick={resetForm}
+            className="flex items-center gap-2 px-3 py-2 rounded-xl font-bold text-xs bg-white text-ink border border-slate-200 hover:bg-slate-50 transition-all shadow-sm active:scale-95"
+            title="开新的一页 (清空当前)"
+          >
+            <Plus className="w-4 h-4" />
+            新一页
+          </button>
+
+          <button 
             onClick={handleSave}
             disabled={saveStatus !== 'idle'}
             className={`flex items-center gap-2 px-4 py-2 rounded-xl font-bold text-xs transition-all shadow-lg ${
@@ -346,7 +431,7 @@ export default function App() {
             }`}
           >
             {saveStatus === 'saving' ? <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" /> : saveStatus === 'success' ? <Check className="w-4 h-4" /> : <Save className="w-4 h-4" />}
-            {saveStatus === 'saving' ? '保存并分析中...' : saveStatus === 'success' ? '已分析并留存' : '分析并保存当前'}
+            {saveStatus === 'saving' ? '正在快速保存...' : saveStatus === 'success' ? '已保存到历史' : '快速保存当前'}
           </button>
           <div className="hidden md:flex flex-col items-end">
             <div className="text-[11px] font-bold text-emerald-600 flex items-center gap-1.5 uppercase tracking-wider">
@@ -410,7 +495,7 @@ export default function App() {
                     <div className="flex justify-between items-center px-2 py-1 border-b border-slate-100 mb-1">
                       <div className="flex items-center gap-2">
                         <span className="text-[10px] font-bold text-muted uppercase">
-                          {currentUser ? `[ ${currentUser} ] 的记录` : '公共记录'} ({filteredHistory.length})
+                          {currentUser ? `[ ${currentUser} ] 的记录` : '公共记录'} ({filteredHistory.length}/100)
                         </span>
                       </div>
                       <div className="flex items-center gap-3">
@@ -421,7 +506,13 @@ export default function App() {
                           <Download className="w-2.5 h-2.5" /> 导出高清 Excel (含图)
                         </button>
                         <button 
-                          onClick={(e) => { e.stopPropagation(); if (confirm('确认清空所有 50 条记录吗？')) { setSourceHistory([]); localStorage.removeItem('sourceHistory'); } }}
+                          onClick={async (e) => { 
+                            e.stopPropagation(); 
+                            if (confirm('确认清空所有历史记录吗？')) { 
+                              setSourceHistory([]); 
+                              await localforage.removeItem('sourceHistory'); 
+                            } 
+                          }}
                           className="text-[10px] text-red-500 hover:underline font-bold"
                         >
                           清空
@@ -433,7 +524,17 @@ export default function App() {
                         key={idx} 
                         className="group flex items-center gap-3 p-2 hover:bg-slate-50 rounded-lg cursor-pointer transition-colors border border-transparent hover:border-slate-100"
                         onClick={() => {
-                          setProductInfo({...productInfo, name: item.name, link: item.link, image: item.image || ''});
+                          if (item.fullState) {
+                            setProductInfo(item.fullState.productInfo);
+                            setVariants(item.fullState.variants);
+                            setRates(item.fullState.rates);
+                            setBaseCost(item.fullState.baseCost);
+                            setCountries(item.fullState.countries);
+                            if (item.fullState.marketingMultiplier) setMarketingMultiplier(item.fullState.marketingMultiplier);
+                          } else {
+                            // 兼容旧版数据
+                            setProductInfo({...productInfo, name: item.name, link: item.link, image: item.image || ''});
+                          }
                           setShowHistory(false);
                         }}
                       >
@@ -1004,6 +1105,126 @@ export default function App() {
           );
         })}
       </div>
+
+      {/* 定价公式说明文档 (Calculation Methodology) */}
+      <section className="bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm mt-2">
+        <div className="bg-slate-800 px-6 py-3 flex items-center gap-2">
+          <Calculator className="w-4 h-4 text-blue-400" />
+          <h2 className="text-sm font-bold text-white uppercase tracking-wider">算法公式与逻辑详解</h2>
+        </div>
+        
+        <div className="p-6 space-y-8">
+          {/* 上部：变量定义 */}
+          <div className="bg-slate-50 p-4 rounded-xl border border-slate-200">
+            <h3 className="text-[10px] font-black text-slate-500 uppercase mb-3 tracking-widest flex items-center gap-2">
+              <span className="w-1 h-3 bg-slate-400 rounded-full"></span> 核心变量定义
+            </h3>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4 font-mono text-[10px]">
+              <div><span className="text-blue-600 font-bold">成本_总:</span> 总基础成本 (RMB)</div>
+              <div><span className="text-blue-600 font-bold">汇率:</span> 实时汇率</div>
+              <div><span className="text-blue-600 font-bold">售价_当地:</span> 当地打折后售价</div>
+              <div><span className="text-blue-600 font-bold">费率_总%:</span> 综合费率总和 (%)</div>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+            {/* 左侧：正推逻辑 */}
+            <div className="space-y-4">
+              <div className="flex items-center gap-2 pb-2 border-b border-slate-100">
+                <div className="w-1.5 h-1.5 rounded-full bg-emerald-500"></div>
+                <h3 className="text-xs font-black text-ink uppercase">场景 A：已知售价 &rarr; 求利润 (分步计算)</h3>
+              </div>
+              
+              <div className="space-y-4 font-mono text-[11px] leading-relaxed">
+                <div className="bg-white p-3 rounded-lg border border-slate-100 shadow-sm">
+                  <div className="text-emerald-600 font-bold mb-1">第一步. 计算总硬性成本 (人民币)</div>
+                  <div className="pl-3 py-1 border-l-2 border-emerald-100">
+                    <p className="text-ink">成本_总 = 采购原价 + 国内运费 + 贴标费 + 国际/头程运费</p>
+                  </div>
+                </div>
+
+                <div className="bg-white p-3 rounded-lg border border-slate-100 shadow-sm">
+                  <div className="text-emerald-600 font-bold mb-1">第二步. 计算当地收入折本币 (人民币)</div>
+                  <div className="pl-3 py-1 border-l-2 border-emerald-100">
+                    <p className="text-ink">收入_人民币 = 售价_当地 &divide; 汇率</p>
+                  </div>
+                </div>
+
+                <div className="bg-white p-3 rounded-lg border border-slate-100 shadow-sm">
+                  <div className="text-emerald-600 font-bold mb-1">第三步. 计算平台变动抽成 (人民币)</div>
+                  <div className="pl-3 py-1 border-l-2 border-emerald-100">
+                    <p className="text-ink">扣费_人民币 = 收入_人民币 &times; (佣金% + 达人% + 损耗% + 广告% + 营销%)</p>
+                  </div>
+                </div>
+
+                <div className="bg-white p-3 rounded-lg border border-slate-200 shadow-md">
+                  <div className="text-emerald-700 font-black mb-1">第四步. 结算单票纯利与毛利率</div>
+                  <div className="pl-3 py-1 border-l-2 border-emerald-500">
+                    <p className="text-ink font-bold">净利润 = 收入_人民币 - 成本_总 - 扣费_人民币</p>
+                    <p className="text-emerald-700 font-black mt-1">毛利率% = (净利润 &divide; 收入_人民币) &times; 100%</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* 右侧：反推逻辑 */}
+            <div className="space-y-4">
+              <div className="flex items-center gap-2 pb-2 border-b border-slate-100">
+                <div className="w-1.5 h-1.5 rounded-full bg-blue-500"></div>
+                <h3 className="text-xs font-black text-ink uppercase">场景 B：已知目标利润 &rarr; 反推售价 (数学推导)</h3>
+              </div>
+              
+              <div className="space-y-4 font-mono text-[11px] leading-relaxed">
+                <div className="bg-white p-3 rounded-lg border border-slate-100 shadow-sm">
+                  <div className="text-blue-600 font-bold mb-1">第一步. 确定利润方程平衡点</div>
+                  <div className="pl-3 py-1 border-l-2 border-blue-100 italic opacity-70 text-[10px]">
+                    设人民币售价为 X：<br/>
+                    X - 成本_总 - (X &times; 费率_总%) = X &times; 目标利润率%
+                  </div>
+                </div>
+
+                <div className="bg-white p-3 rounded-lg border border-slate-100 shadow-sm">
+                  <div className="text-blue-600 font-bold mb-1">第二步. 计算安全收入系数</div>
+                  <div className="pl-3 py-1 border-l-2 border-blue-100">
+                    <p className="text-ink">系数 = 1 - 费率_总% - 目标利润率%</p>
+                  </div>
+                </div>
+
+                <div className="bg-white p-3 rounded-lg border border-slate-100 shadow-sm">
+                  <div className="text-blue-600 font-bold mb-1">第三步. 求出目标人民币售价</div>
+                  <div className="pl-3 py-1 border-l-2 border-blue-100">
+                    <p className="text-ink font-bold">X = 成本_总 &divide; 系数</p>
+                  </div>
+                </div>
+
+                <div className="bg-white p-3 rounded-lg border border-slate-200 shadow-md">
+                  <div className="text-blue-700 font-black mb-1">第四步. 转换当地货币及前端显示</div>
+                  <div className="pl-3 py-1 border-l-2 border-blue-500">
+                    <p className="text-ink font-bold">售价_当地 = X &times; 汇率</p>
+                    <p className="text-blue-700 font-black mt-1">前端显示价 = 售价_当地 &times; 营销倍数</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="bg-slate-50 border-t border-slate-100 p-4">
+          <div className="flex items-start gap-3">
+            <div className="mt-1 flex-shrink-0">
+              <Info className="w-3.5 h-3.5 text-blue-500" />
+            </div>
+            <div>
+              <h4 className="text-[11px] font-black text-ink uppercase mb-1">专业名词名词解释 (Glossary)</h4>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-y-2 gap-x-6">
+                <div className="text-[10px] leading-relaxed"><strong className="text-emerald-700">营销倍数:</strong> 用于前端虚标高价，方便设置大额折扣（如买一送一或5折活动），不影响实际核算利润。</div>
+                <div className="text-[10px] leading-relaxed"><strong className="text-emerald-700">售后/营销损耗:</strong> 预估的退货、补发或退款成本，作为安全垫计入费率，降低经营风险。</div>
+                <div className="text-[10px] leading-relaxed"><strong className="text-emerald-700">扣费总率:</strong> 平台所有官方扣费（佣金、税等）与各种变动成本（广告、达人佣金）之和。</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
 
       {/* Footer */}
       <footer className="mt-4 pt-4 border-t border-slate-200 flex flex-col md:flex-row justify-between items-center gap-4 text-[11px] text-muted font-medium">
